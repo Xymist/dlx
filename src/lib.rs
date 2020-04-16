@@ -22,23 +22,36 @@ struct MtxElem {
     down: Index,
 }
 
+enum HorizontalOrder {
+    Left,
+    Right,
+}
+
 /// An assembled matrix, for solving a specific problem
-struct Solver {
-    pub subset_rows: HashMap<usize, usize>,
+#[derive(Debug)]
+struct Solver<T: PartialEq + std::fmt::Debug> {
+    pub subset_rows: HashMap<usize, Subset<T>>,
     pub elements: Vec<MtxElem>,
     pub bottoms: Vec<Index>,
 
     // The number of columns still participating in the algorithm. If this
     // falls to zero, a solution has been found.
     pub active_columns: usize,
+
+    // All solutions so far discovered.
+    solutions: Vec<Vec<Index>>,
+
+    // Buffer for indices of rows included in the current solution.
+    // Flushed to self.solutions on success, wiped on failure.
+    solution_buffer: Vec<Index>,
 }
 
-impl Solver {
+impl<T: PartialEq + std::fmt::Debug> Solver<T> {
     // For reasons of efficiency, we choose the column containing
     // the smallest number of ones (which in this sparse matrix is
     // the smallest column) at each iteration of the algorithm.
     // This minimises the number of levels in each branch of the tree.
-    fn smallest_column(&self) -> Index {
+    fn smallest_column(&self) -> Option<Index> {
         let mut smol_count = Index::max_value();
         let mut smol_idx: Index = 0;
         let mut col_idx: Index = 0;
@@ -54,12 +67,94 @@ impl Solver {
             col_idx = self.elements[col_idx].right
         }
 
-        smol_idx
+        match smol_count {
+            // If the smallest column has ZERO ones, then this matrix cannot be
+            // solved. This will terminate this branch of the algorithm.
+            0 => None,
+            _ => Some(smol_idx),
+        }
     }
 
-    pub fn solve(&mut self) {}
+    // Get all members of a specified row NOT in the specified column.
+    fn row(&self, idx: Index, ord: HorizontalOrder) -> Vec<Index> {
+        let mut es = self.elements.clone();
+        match ord {
+            HorizontalOrder::Left => {
+                es.sort_by(|a, b| a.col.partial_cmp(&b.col).unwrap());
+            }
+            HorizontalOrder::Right => {
+                es.sort_by(|a, b| b.col.partial_cmp(&a.col).unwrap());
+            }
+        }
 
-    fn subsolve(&mut self) {}
+        es.iter()
+            .enumerate()
+            .filter(|(_, e)| e.row == idx)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    // Get all members of a specified column NOT in the specified row
+    fn column(&self, idx: Index) -> Vec<Index> {
+        let mut es = self.elements.clone();
+        es.sort_by(|a, b| b.row.partial_cmp(&a.row).unwrap());
+        es.iter()
+            .enumerate()
+            .filter(|(_, e)| e.col == idx)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn result(mut self) -> Vec<Vec<Subset<T>>> {
+        let mut result: Vec<Vec<Subset<T>>> = Vec::new();
+        for solution in self.solutions.iter() {
+            let mut solution_subsets = Vec::new();
+            for idx in solution {
+                solution_subsets.push(self.subset_rows.remove(idx).unwrap());
+            }
+            result.push(solution_subsets);
+        }
+        result
+    }
+
+    pub fn solve(&mut self) {
+        // If all elements have been removed, that's all columns
+        // covered. We have a successful solution.
+        if self.elements.is_empty() {
+            self.solutions.push(self.solution_buffer.clone());
+            return;
+        }
+
+        let smallest = self.smallest_column();
+
+        if smallest.is_none() {
+            // Failure; this path is not a solution.
+            return;
+        }
+
+        let smol = smallest.unwrap();
+
+        self.cover(smol);
+
+        for row_idx in self.column(smol) {
+            // add it to the partial solution,
+            self.solution_buffer.push(row_idx);
+            // cover all the other rows with overlapping entries,
+            for col_idx in self.row(row_idx, HorizontalOrder::Right) {
+                let idx = self.elements[col_idx].col;
+                self.cover(idx);
+            }
+            // recurse,
+            self.solve();
+            // then undo.
+            for col_idx in self.row(row_idx, HorizontalOrder::Left) {
+                let idx = self.elements[col_idx].col;
+                self.uncover(idx);
+            }
+            self.solution_buffer.pop();
+        }
+        self.uncover(smol);
+    }
 
     fn cover(&mut self, col_idx: Index) {
         // Find the horizontal neighbours of the chosen column
@@ -82,6 +177,10 @@ impl Solver {
                 // Find the header for this column and reduce its count
                 // of ones by one
                 let header = self.elements[rgt].col;
+                dbg!(&self.elements);
+                if self.elements[header].size == 0 {
+                    continue;
+                }
                 self.elements[header].size -= 1;
 
                 let col_up = self.elements[rgt].up;
@@ -106,9 +205,10 @@ impl Solver {
             // travels 'left' around the loop rather than 'right'
             let mut lft = self.elements[nxt].left;
             while lft != nxt {
-                // Increase the ones-count of the header by one
-                let col_hdr = self.elements[lft].col;
-                self.elements[col_hdr].size += 1;
+                // Increase the ones-count of the header by one,
+                //re-registering the element we are about to restore
+                let header = self.elements[lft].col;
+                self.elements[header].size += 1;
 
                 let col_up = self.elements[lft].up;
                 self.elements[col_up].down = lft;
@@ -131,22 +231,24 @@ impl Solver {
     }
 }
 
-impl From<Mtx> for Solver {
-    fn from(m: Mtx) -> Self {
+impl<T: PartialEq + std::fmt::Debug> From<Mtx<T>> for Solver<T> {
+    fn from(m: Mtx<T>) -> Self {
         Solver {
             subset_rows: m.subset_rows,
             elements: m.elements,
             active_columns: m.bottoms.len(),
             bottoms: m.bottoms,
+            solution_buffer: Vec::new(),
+            solutions: Vec::new(),
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
-struct Mtx {
+struct Mtx<T: PartialEq + std::fmt::Debug> {
     // Matches each row in the matrix with the ID of its subset,
     // for later analysis
-    pub subset_rows: HashMap<usize, usize>,
+    pub subset_rows: HashMap<usize, Subset<T>>,
     // The matrix itself
     pub elements: Vec<MtxElem>,
     // The 'bottom' elements of each column; i.e. the populated element
@@ -154,7 +256,7 @@ struct Mtx {
     pub bottoms: Vec<Index>,
 }
 
-impl Mtx {
+impl<T: PartialEq + std::fmt::Debug> Mtx<T> {
     pub fn size(&self) -> usize {
         self.elements.len()
     }
@@ -208,18 +310,14 @@ impl Mtx {
         self
     }
 
-    pub fn push_subsets<T: PartialEq>(
-        mut self,
-        collection: &[Subset<T>],
-        universe: &Universe<T>,
-    ) -> Self {
-        for subset in collection.iter() {
+    pub fn push_subsets(mut self, collection: Vec<Subset<T>>, universe: &Universe<T>) -> Self {
+        for subset in collection.into_iter() {
             self.push_subset_as_row(subset, universe)
         }
         self
     }
 
-    fn push_subset_as_row<T: PartialEq>(&mut self, s: &Subset<T>, u: &Universe<T>) {
+    fn push_subset_as_row(&mut self, s: Subset<T>, u: &Universe<T>) {
         let row = self.last_row() + 1;
         let row0 = self.size();
 
@@ -229,27 +327,35 @@ impl Mtx {
             return;
         };
 
-        for (col, c) in u.iter().enumerate() {
-            if s.elements.contains(&c) {
-                let idx = self.size();
-                let elem = MtxElem {
-                    col,
-                    row,
-                    left: idx - 1,
-                    right: idx + 1,
-                    up: self.bottoms[col],
-                    ..Default::default()
-                };
+        for elem in s.elements.iter() {
+            let mut col: usize = 0;
 
-                self.elements.push(elem);
-
-                self.elements[self.bottoms[col]].down = idx;
-
-                self.bottoms[col] = idx;
-
-                self.elements[col].size += 1;
+            if !u.iter().enumerate().any(|(idx, c)| {
+                col = idx;
+                elem == c
+            }) {
+                continue;
             }
+
+            let idx = self.size();
+            let elem = MtxElem {
+                col,
+                row,
+                left: idx - 1,
+                right: idx + 1,
+                up: self.bottoms[col],
+                ..Default::default()
+            };
+
+            self.elements.push(elem);
+
+            self.elements[self.bottoms[col]].down = idx;
+
+            self.bottoms[col] = idx;
+
+            self.elements[col].size += 1;
         }
+
         let rown = self.elements.len() - 1;
 
         self.elements[row0].left = rown;
@@ -257,13 +363,13 @@ impl Mtx {
 
         // This allows us to determine from the solution the exact subsets
         // which comprise it, even when they contain the same elements.
-        self.subset_rows.entry(row).or_insert(s.id);
+        self.subset_rows.insert(row, s);
     }
 
     // Connects the 'bottom' of each column to the 'top',
     // turning the matrix from a ring into a torus. This
     // precludes adding more rows
-    pub fn finalise(mut self) -> Solver {
+    pub fn finalise(mut self) -> Solver<T> {
         for (i, &b) in self.bottoms.iter().enumerate() {
             self.elements[b].down = i;
             self.elements[i].up = b;
@@ -277,7 +383,7 @@ type Collection<T> = Vec<Subset<T>>;
 
 // A strict subset of the universe to be covered, plus some data.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Subset<T: PartialEq> {
+pub struct Subset<T: PartialEq + std::fmt::Debug> {
     // Uniquely identifies the Subset
     id: usize,
     // This variation supports weighted subsets,
@@ -286,7 +392,7 @@ pub struct Subset<T: PartialEq> {
     elements: Vec<T>,
 }
 
-impl<T: PartialEq> Subset<T> {
+impl<T: PartialEq + std::fmt::Debug> Subset<T> {
     pub fn new(id: usize, weight: f64, elements: Vec<T>) -> Self {
         Subset {
             id,
@@ -296,13 +402,20 @@ impl<T: PartialEq> Subset<T> {
     }
 }
 
-pub fn weighted_exact_cover<T: PartialEq>(
+pub fn weighted_exact_cover<T: PartialEq + std::fmt::Debug>(
     u: Universe<T>,
     c: Collection<T>,
 ) -> Option<Vec<Subset<T>>> {
-    let _solver = Mtx::with_capacity(u.len()).push_subsets(&c, &u).finalise();
+    let mut solver = Mtx::with_capacity(u.len()).push_subsets(c, &u).finalise();
 
-    return None;
+    solver.solve();
+    let mut result = solver.result();
+
+    if result.len() == 0 {
+        return None;
+    }
+
+    Some(result.remove(0))
 }
 
 #[cfg(test)]
